@@ -1,4 +1,3 @@
-```markdown
 # docs2xml
 
 **docs2xml** is a command-line utility that crawls website documentation (or any set of web pages) and archives it in **XML** format. This is particularly useful for ingestion into LLM (Large Language Model) pipelines or other text analysis workflows.
