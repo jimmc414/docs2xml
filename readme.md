@@ -87,8 +87,7 @@ Only crawls pages **whose path begins** with `/getting-started`. E.g., `https://
 #### 3. Regex Filtering with `--include-pattern`
 **Regex** can be used to filter in only certain URLs:
 ```bash
-python docs2xml.py crawl https://example.com \
-  --include-pattern="docs"
+python docs2xml.py crawl https://example.com --include-pattern="docs"
 ```
 Only crawls URLs that contain `docs`.
 
@@ -121,9 +120,7 @@ Only crawls URLs that contain `docs`.
 
 5. **Combine with `--restrict-path`**  
    ```bash
-   python docs2xml.py crawl https://docs.example.com/start \
-       --restrict-path \
-       --include-pattern="^https://docs\.example\.com/start/tutorials"
+   python docs2xml.py crawl https://docs.example.com/start --restrict-path --include-pattern="^https://docs\.example\.com/start/tutorials"
    ```
    - Ensures we only crawl the path `/start/...`
    - Further narrows it to URLs containing `/start/tutorials...`
@@ -132,8 +129,7 @@ Only crawls URLs that contain `docs`.
 
 #### 4. Excluding Certain URLs
 ```bash
-python docs2xml.py https://example.com \
-  --exclude-pattern="blog|login"
+python docs2xml.py https://example.com --exclude-pattern="blog|login"
 ```
 Skips URLs that contain the words `blog` or `login`.
 
@@ -141,9 +137,7 @@ Skips URLs that contain the words `blog` or `login`.
 
 #### 5. Following External Links
 ```bash
-python docs2xml.py crawl https://docs.anthropic.com \
-  --follow-links \
-  --max-depth=2
+python docs2xml.py crawl https://docs.anthropic.com --follow-links --max-depth=2
 ```
 Includes external domains and limits recursion depth to 2.
 
