@@ -77,8 +77,7 @@ Crawls `https://docs.anthropic.com` with default settings: depth = 5, pages = 10
 
 #### 2. Enabling the `--restrict-path` Switch
 ```bash
-python docs2xml.py crawl https://docs.software.ai/getting-started \
-    --restrict-path
+python docs2xml.py crawl https://docs.software.ai/getting-started --restrict-path
 ```
 Only crawls pages **whose path begins** with `/getting-started`. E.g., `https://docs.software.ai/getting-started/foo`, etc.
 
@@ -145,9 +144,7 @@ Includes external domains and limits recursion depth to 2.
 
 #### 6. Concurrency & Delay Tweaks
 ```bash
-python docs2xml.py https://docs.anthropic.com \
-  --concurrency=10 \
-  --delay=0.1
+python docs2xml.py https://docs.anthropic.com --concurrency=10 --delay=0.1
 ```
 Uses 10 worker tasks with a 0.1s delay.
 
