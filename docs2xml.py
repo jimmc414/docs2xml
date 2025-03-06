@@ -3,8 +3,8 @@
 DocCrawler: A CLI utility to crawl website documentation and archive it in XML format for LLM ingestion.
 
 Usage:
-    python doc_crawler.py crawl <start_url> [options]
-    python doc_crawler.py --help
+    python docs2xml.py crawl <start_url> [options]
+    python docs2xml.py --help
 
 Options:
     --output-file=<file>        Output XML file [default: docs_archive.xml]
@@ -26,69 +26,7 @@ Options:
     --strip-comments            Remove HTML comments [default: True]
     --robots-txt                Respect robots.txt rules [default: False]
     --concurrency=<N>           Number of concurrent requests [default: 5]
-"""
-
-import sys
-
-# Insert default subcommand "crawl" if none is provided
-if len(sys.argv) <= 1 or sys.argv[1] not in ['crawl', 'version']:
-    sys.argv.insert(1, 'crawl')
-
-import argparse
-import asyncio
-import logging
-import re
-import time
-import xml.dom.minidom
-from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import urljoin, urlparse
-
-try:
-    import aiohttp
-    import bs4
-    from bs4 import BeautifulSoup
-    from lxml import etree
-    import readability
-    from readability import Document
-    import langdetect
-    from langdetect import detect_langs
-    import tqdm
-    import colorama
-    from colorama import Fore, Style
-    from urllib.robotparser import RobotFileParser
-except ImportError as e:
-    print(f"Error: Required dependency not found: {e}")
-    print("Please install all required dependencies with:")
-    print("pip install aiohttp beautifulsoup4 lxml readability-lxml langdetect tqdm colorama python-robots")
-    sys.exit(1)
-#!/usr/bin/env python3
-"""
-DocCrawler: A CLI utility to crawl website documentation and archive it in XML format for LLM ingestion.
-
-Usage:
-    python doc_crawler.py crawl <start_url> [options]
-    python doc_crawler.py --help
-
-Options:
-    --output-file=<file>        Output XML file [default: docs_archive.xml]
-    --max-depth=<depth>         Maximum crawl depth [default: 5]
-    --max-pages=<pages>         Maximum pages to crawl [default: 1000]
-    --user-agent=<agent>        User agent string [default: DocCrawler/1.0]
-    --delay=<seconds>           Delay between requests in seconds [default: 0.2]
-    --include-pattern=<regex>   URL pattern to include [default: None]
-    --exclude-pattern=<regex>   URL pattern to exclude [default: None]
-    --timeout=<seconds>         Request timeout in seconds [default: 30]
-    --verbose                   Verbose output [default: False]
-    --include-images            Include image descriptions in output [default: False]
-    --include-code              Include code blocks with language detection [default: True]
-    --extract-headings          Extract and hierarchically organize headings [default: True]
-    --follow-links              Follow links to external domains [default: False]
-    --clean-html                Enhance cleaning of HTML content [default: True]
-    --strip-js                  Remove JavaScript content [default: True]
-    --strip-css                 Remove CSS content [default: True]
-    --strip-comments            Remove HTML comments [default: True]
-    --robots-txt                Respect robots.txt rules [default: False]
-    --concurrency=<N>           Number of concurrent requests [default: 5]
+    --restrict-path             Restrict crawling to paths starting with the start_url's path [default: False]
 """
 
 import sys
@@ -161,21 +99,25 @@ class DocCrawler:
         self.strip_css = args.strip_css
         self.strip_comments = args.strip_comments
         self.respect_robots = args.robots_txt
-        
-        # NEW: concurrency argument
         self.concurrency = args.concurrency
-        
-        # Initialize state
+        self.restrict_path = args.restrict_path  # NEW ARGUMENT
+
+        # State
         self.visited_urls: Set[str] = set()
-        # We'll now feed URLs into an asyncio.Queue, instead of storing them in a list.
         self.pages_crawled = 0
-        self.failed_urls: List[Tuple[str, str]] = []  # (url, error_message)
+        self.failed_urls: List[Tuple[str, str]] = []
         self.domain = urlparse(self.start_url).netloc
+        
+        # We'll parse the path from start_url and store it
+        parsed_start = urlparse(self.start_url)
+        self.start_url_domain = parsed_start.netloc
+        self.start_url_path = parsed_start.path or "/"
+
         self.robots_parsers: Dict[str, RobotFileParser] = {}
         self.xml_root = None
         self.session = None
         
-        # Set up progress bar (will be used in concurrency)
+        # Progress bar
         self.pbar = None
         
         if self.verbose:
@@ -211,45 +153,50 @@ class DocCrawler:
             parser.set_url(robots_url)
             
             try:
-                # Synchronous fetch of robots.txt - only happens once per domain
                 parser.read()
                 self.robots_parsers[domain] = parser
                 
-                if not any(rule.pattern for rule in parser._rules):  # If there are no Disallow directives
-                    return True  # Allow crawling by default
+                # If no rules are specified, allow by default
+                if not any(rule.pattern for rule in parser._rules):
+                    return True
             except Exception as e:
                 logger.warning(f"Could not fetch robots.txt for {domain}: {e}")
-                # If we can't fetch robots.txt, we'll assume it's okay to crawl
+                # If we can't fetch robots.txt, assume OK to crawl
                 return True
         
         return self.robots_parsers[domain].can_fetch(self.user_agent, url)
     
     def should_crawl(self, url: str) -> bool:
-        """Determine if URL should be crawled based on patterns and domain."""
+        """Determine if URL should be crawled based on patterns, domain, path, etc."""
         parsed_url = urlparse(url)
         
-        # Skip URLs that are not http or https
+        # Only handle http/https
         if parsed_url.scheme not in ('http', 'https'):
             return False
             
-        # Skip URLs that have already been visited
+        # If we don't follow external links, only crawl the same domain
+        if not self.follow_links and parsed_url.netloc != self.domain:
+            return False
+
+        # If --restrict-path is set, require the path to start with start_url_path
+        if self.restrict_path:
+            if not parsed_url.path.startswith(self.start_url_path):
+                return False
+
+        # Skip if we've already visited
         if url in self.visited_urls:
             return False
             
-        # Skip URLs based on max pages
+        # Skip if we've hit max pages
         if self.pages_crawled >= self.max_pages:
             return False
             
-        # Skip URLs that don't match include pattern
+        # If include_pattern is set, skip URLs that do not match it
         if self.include_pattern and not self.include_pattern.search(url):
             return False
             
-        # Skip URLs that match exclude pattern
+        # If exclude_pattern is set, skip URLs that do match it
         if self.exclude_pattern and self.exclude_pattern.search(url):
-            return False
-            
-        # Handle external domains
-        if not self.follow_links and parsed_url.netloc != self.domain:
             return False
             
         # Check robots.txt
@@ -292,12 +239,11 @@ class DocCrawler:
         
         for link in soup.find_all('a', href=True):
             href = link['href'].strip()
-            
-            # Skip empty links, anchors, or javascript
+            # Skip anchors, js calls, etc.
             if not href or href.startswith('#') or href.startswith('javascript:'):
                 continue
                 
-            # Convert relative URL to absolute
+            # Convert relative to absolute
             full_url = urljoin(base_url, href)
             
             # Remove fragments
@@ -309,10 +255,10 @@ class DocCrawler:
         
     def detect_code_language(self, code: str) -> str:
         """Attempt to detect programming language of code block."""
-        # Simple heuristics for language detection
+        # Very rough heuristics
         if re.search(r'^\s*(import|from)\s+\w+\s+import|def\s+\w+\s*\(|class\s+\w+[:\(]', code):
             return "python"
-        elif re.search(r'^\s*(function|const|let|var|import)\s+|=>|{\s*\n|export\s+', code):
+        elif re.search(r'^\s*(function|const|let|var|import)\s+|=\>|{\s*\n|export\s+', code):
             return "javascript"
         elif re.search(r'^\s*(#include|int\s+main|using\s+namespace)', code):
             return "cpp"
@@ -328,29 +274,20 @@ class DocCrawler:
             return "html"
         elif re.search(r'^\s*(SELECT|INSERT|UPDATE|DELETE|CREATE TABLE)', code, re.IGNORECASE):
             return "sql"
-        # Default to "code" if no specific language detected
         return "code"
         
     def clean_text(self, text: str) -> str:
         """Clean and normalize text content."""
         if not text:
             return ""
-            
-        # Replace multiple whitespace with single space
-        text = re.sub(r'\s+', ' ', text)
-        # Remove leading and trailing whitespace
-        text = text.strip()
-        # Replace special Unicode whitespace characters
+        text = re.sub(r'\s+', ' ', text).strip()
         text = re.sub(r'[\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]', ' ', text)
-        # Replace special quotes with standard quotes
         text = re.sub(r'[\u2018\u2019]', "'", text)
         text = re.sub(r'[\u201C\u201D]', '"', text)
-        
         return text
         
     def process_html(self, html: str, url: str) -> Dict:
         """Process HTML content and extract structured information."""
-        # Use readability to extract main content
         try:
             doc = Document(html)
             title = doc.title()
@@ -361,21 +298,16 @@ class DocCrawler:
             else:
                 soup = BeautifulSoup(html, 'lxml')
                 
-            # Remove unwanted elements
             if self.strip_js:
                 for script in soup.find_all('script'):
                     script.decompose()
-                    
             if self.strip_css:
                 for style in soup.find_all('style'):
                     style.decompose()
-            
-            # Remove HTML comments if strip_comments is True
             if self.strip_comments:
                 for comment in soup.find_all(string=lambda text: isinstance(text, bs4.Comment)):
                     comment.extract()
                     
-            # Extract page metadata
             meta_tags = {}
             for meta in soup.find_all('meta'):
                 if meta.get('name') and meta.get('content'):
@@ -383,7 +315,6 @@ class DocCrawler:
                 elif meta.get('property') and meta.get('content'):
                     meta_tags[meta['property']] = meta['content']
             
-            # Extract structured content
             content_data = self.extract_structured_content(soup, url)
             
             return {
@@ -406,11 +337,10 @@ class DocCrawler:
         """Extract structured content from the page."""
         content_blocks = []
         
-        # Handle heading extraction if enabled
+        # Headings
         if self.extract_headings:
             content_blocks.extend(self.extract_hierarchical_content(soup))
         else:
-            # Extract paragraphs
             for p in soup.find_all('p'):
                 text = self.clean_text(p.get_text())
                 if text:
@@ -418,15 +348,12 @@ class DocCrawler:
                         'type': 'paragraph',
                         'text': text
                     })
-                    
-            # Extract lists
             for list_elem in soup.find_all(['ul', 'ol']):
                 items = []
                 for li in list_elem.find_all('li'):
                     item_text = self.clean_text(li.get_text())
                     if item_text:
                         items.append(item_text)
-                        
                 if items:
                     content_blocks.append({
                         'type': 'list',
@@ -434,11 +361,11 @@ class DocCrawler:
                         'items': items
                     })
         
-        # Extract code blocks
+        # Code blocks
         if self.include_code:
             for code_elem in soup.find_all(['pre', 'code']):
                 code_text = code_elem.get_text()
-                if code_text and len(code_text.strip()) > 0:
+                if code_text and code_text.strip():
                     lang = self.detect_code_language(code_text)
                     content_blocks.append({
                         'type': 'code',
@@ -446,13 +373,12 @@ class DocCrawler:
                         'code': code_text
                     })
         
-        # Extract images if enabled
+        # Images
         if self.include_images:
             for img in soup.find_all('img'):
                 alt_text = img.get('alt', '')
                 src = img.get('src', '')
                 if src:
-                    # Convert relative URL to absolute
                     img_url = urljoin(url, src)
                     content_blocks.append({
                         'type': 'image',
@@ -460,30 +386,25 @@ class DocCrawler:
                         'alt_text': alt_text
                     })
         
-        # Extract tables
+        # Tables
         for table in soup.find_all('table'):
             table_data = []
             headers = []
             
-            # Extract headers first
             thead = table.find('thead')
             if thead:
                 th_rows = thead.find_all('tr')
                 for row in th_rows:
                     headers.extend([self.clean_text(cell.get_text()) for cell in row.find_all(['th', 'td'])])
             else:
-                # If no thead, check first row for th tags
                 first_row = table.find('tr')
                 if first_row:
                     th_cells = first_row.find_all('th')
                     if th_cells:
                         headers = [self.clean_text(cell.get_text()) for cell in th_cells]
             
-            # Extract rows
             tbody = table.find('tbody') or table
             rows = tbody.find_all('tr')
-            
-            # Skip first row if we already used it for headers
             start_idx = 1 if headers and not table.find('thead') and table.find('tr').find('th') else 0
             
             for row in rows[start_idx:]:
@@ -505,7 +426,6 @@ class DocCrawler:
         """Extract content with hierarchical structure based on headings."""
         content_blocks = []
         
-        # Find all heading elements and content elements
         elements = soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'ul', 'ol'])
         
         current_heading = {'type': 'heading', 'level': 0, 'text': '', 'children': []}
@@ -513,31 +433,21 @@ class DocCrawler:
         
         for elem in elements:
             if elem.name.startswith('h') and len(elem.name) == 2:
-                # This is a heading element
                 level = int(elem.name[1])
                 heading_text = self.clean_text(elem.get_text())
-                
                 if not heading_text:
                     continue
-                    
-                # Pop stack until we find a heading of higher level (smaller number)
                 while level <= heading_stack[-1]['level'] and len(heading_stack) > 1:
                     heading_stack.pop()
-                
-                # Create new heading at this level
                 new_heading = {
                     'type': 'heading',
                     'level': level,
                     'text': heading_text,
                     'children': []
                 }
-                
-                # Add to parent's children and update stack
                 heading_stack[-1]['children'].append(new_heading)
                 heading_stack.append(new_heading)
-                
             else:
-                # This is content under the current heading
                 if elem.name == 'p':
                     text = self.clean_text(elem.get_text())
                     if text:
@@ -551,7 +461,6 @@ class DocCrawler:
                         item_text = self.clean_text(li.get_text())
                         if item_text:
                             items.append(item_text)
-                            
                     if items:
                         heading_stack[-1]['children'].append({
                             'type': 'list',
@@ -559,7 +468,6 @@ class DocCrawler:
                             'items': items
                         })
         
-        # Flatten the hierarchical structure
         def flatten_hierarchy(node):
             result = []
             if node['type'] == 'heading' and node['level'] > 0:
@@ -568,7 +476,6 @@ class DocCrawler:
                     'level': node['level'],
                     'text': node['text']
                 })
-                
             for child in node.get('children', []):
                 if isinstance(child, dict) and child.get('type') == 'heading':
                     result.extend(flatten_hierarchy(child))
@@ -576,7 +483,6 @@ class DocCrawler:
                     result.append(child)
             return result
             
-        # Process all top-level headings
         for child in heading_stack[0]['children']:
             content_blocks.extend(flatten_hierarchy(child))
             
@@ -584,14 +490,11 @@ class DocCrawler:
         
     def create_xml_document(self) -> None:
         """Create the XML document structure."""
-        # Create root element
         self.xml_doc = xml.dom.minidom.getDOMImplementation().createDocument(None, "documentation", None)
         self.xml_root = self.xml_doc.documentElement
         
-        # Add crawler metadata
         metadata = self.xml_doc.createElement("metadata")
         
-        # Add various metadata elements
         self.add_element(metadata, "created_at", time.strftime("%Y-%m-%d %H:%M:%S"))
         self.add_element(metadata, "crawler_version", "1.0")
         self.add_element(metadata, "start_url", self.start_url)
@@ -620,98 +523,71 @@ class DocCrawler:
         page_elem = self.xml_doc.createElement("page")
         page_elem.setAttribute("url", page_data['url'])
         
-        # Add title
         self.add_element(page_elem, "title", page_data['title'])
         
-        # Add metadata
         if page_data['meta']:
             meta_elem = self.xml_doc.createElement("meta")
             for key, value in page_data['meta'].items():
                 self.add_element(meta_elem, "meta_item", value, {"name": key})
             page_elem.appendChild(meta_elem)
             
-        # Add content
         content_elem = self.xml_doc.createElement("content")
         for block in page_data['content']:
             block_type = block['type']
-            
             if block_type == 'paragraph':
                 self.add_element(content_elem, "paragraph", block['text'])
-                
             elif block_type == 'heading':
                 self.add_element(content_elem, "heading", block['text'], {"level": str(block['level'])})
-                
             elif block_type == 'list':
                 list_elem = self.xml_doc.createElement("list")
                 list_elem.setAttribute("type", block['list_type'])
-                
                 for item in block['items']:
                     self.add_element(list_elem, "item", item)
-                    
                 content_elem.appendChild(list_elem)
-                
             elif block_type == 'code':
                 self.add_element(content_elem, "code", block['code'], {"language": block['language']})
-                
             elif block_type == 'image':
                 self.add_element(content_elem, "image", block['alt_text'], {"src": block['url']})
-                
             elif block_type == 'table':
                 table_elem = self.xml_doc.createElement("table")
-                
-                # Add headers if present
                 if block['headers']:
                     headers_elem = self.xml_doc.createElement("headers")
                     for header in block['headers']:
                         self.add_element(headers_elem, "header", header)
                     table_elem.appendChild(headers_elem)
-                    
-                # Add rows
                 for row in block['rows']:
                     row_elem = self.xml_doc.createElement("row")
                     for cell in row:
                         self.add_element(row_elem, "cell", cell)
                     table_elem.appendChild(row_elem)
-                    
                 content_elem.appendChild(table_elem)
-                
         page_elem.appendChild(content_elem)
         self.xml_root.appendChild(page_elem)
         
     def save_xml_to_file(self) -> None:
         """Save the XML document to file."""
-        # Format and indent the XML
         pretty_xml = self.xml_doc.toprettyxml(indent="  ")
-        
-        # Remove empty lines (a common issue with toprettyxml)
         pretty_xml = '\n'.join([line for line in pretty_xml.split('\n') if line.strip()])
         
         try:
             with open(self.output_file, 'w', encoding='utf-8') as f:
                 f.write(pretty_xml)
-                
             logger.info(f"XML saved to {self.output_file}")
             print(f"{Fore.GREEN}Successfully saved documentation to {self.output_file}{Style.RESET_ALL}")
-            
-            # Print stats
             print(f"\n{Fore.CYAN}Crawl Statistics:{Style.RESET_ALL}")
             print(f"Pages crawled: {self.pages_crawled}")
             print(f"Failed URLs: {len(self.failed_urls)}")
-            
             if self.failed_urls and self.verbose:
                 print(f"\n{Fore.YELLOW}Failed URLs:{Style.RESET_ALL}")
-                for url, error in self.failed_urls[:10]:  # Show only first 10 failures
+                for url, error in self.failed_urls[:10]:
                     print(f"- {url}: {error}")
-                    
                 if len(self.failed_urls) > 10:
                     print(f"... and {len(self.failed_urls) - 10} more. Check logs for details.")
-                    
         except Exception as e:
             logger.error(f"Error saving XML file: {e}")
             print(f"{Fore.RED}Error saving XML file: {e}{Style.RESET_ALL}")
             return
         
-        # Copy to clipboard (if pyperclip installed)
         try:
             import pyperclip
             pyperclip.copy(pretty_xml)
@@ -720,37 +596,31 @@ class DocCrawler:
         except ImportError:
             logger.warning("pyperclip not installed; cannot copy to clipboard")
         
-        # Compute and print total token count (if tiktoken installed)
         try:
             import tiktoken
-            enc = tiktoken.get_encoding("cl100k_base")  # Commonly used for ChatGPT
+            enc = tiktoken.get_encoding("cl100k_base")
             tokens = enc.encode(pretty_xml)
             token_count = len(tokens)
             print(f"{Fore.MAGENTA}Total tokens in output: {token_count}{Style.RESET_ALL}")
         except ImportError:
             logger.warning("tiktoken not installed; cannot compute token count")
         
-        # Print crawl stats
         print(f"\n{Fore.CYAN}Crawl Statistics:{Style.RESET_ALL}")
         print(f"Pages crawled: {self.pages_crawled}")
         print(f"Failed URLs: {len(self.failed_urls)}")
         if self.failed_urls and self.verbose:
             print(f"\n{Fore.YELLOW}Failed URLs:{Style.RESET_ALL}")
-            for url, error in self.failed_urls[:10]:  # only show first 10
+            for url, error in self.failed_urls[:10]:
                 print(f"- {url}: {error}")
             if len(self.failed_urls) > 10:
                 print(f"... and {len(self.failed_urls) - 10} more. Check logs for details.")
 
     async def worker(self, queue: "asyncio.Queue[Tuple[str,int]]"):
-        """
-        A worker task that continuously pulls (url, depth) from the queue,
-        crawls it if eligible, and enqueues new links until max_pages is reached.
-        """
+        """Continuously pulls (url, depth) from the queue, crawls it if eligible, and enqueues new links."""
         while True:
             try:
                 url, depth = await queue.get()
                 
-                # If we've already crawled enough pages, just mark done and continue
                 if self.pages_crawled >= self.max_pages:
                     queue.task_done()
                     continue
@@ -759,14 +629,10 @@ class DocCrawler:
                     queue.task_done()
                     continue
 
-                # Mark as visited
                 self.visited_urls.add(url)
-
-                # Respect delay between requests
                 await asyncio.sleep(self.delay)
-
-                # Fetch URL
                 logger.debug(f"Fetching {url} at depth {depth}")
+                
                 html, error = await self.fetch_url(url)
                 if error:
                     logger.warning(f"Failed to fetch {url}: {error}")
@@ -774,28 +640,23 @@ class DocCrawler:
                     queue.task_done()
                     continue
 
-                # Process page
                 page_data = self.process_html(html, url)
                 self.add_page_to_xml(page_data)
 
-                # Update stats
                 self.pages_crawled += 1
                 if self.pbar:
                     self.pbar.update(1)
                 
-                # Extract and enqueue links if not at max depth
                 if depth < self.max_depth:
                     soup = BeautifulSoup(html, 'lxml')
                     links = self.extract_links(soup, url)
                     for link in links:
-                        # Only enqueue if we haven't exceeded max_pages
                         if self.pages_crawled < self.max_pages:
                             await queue.put((link, depth + 1))
 
                 queue.task_done()
             
             except asyncio.CancelledError:
-                # Worker is being canceled (e.g., on shutdown)
                 break
             except Exception as e:
                 logger.error(f"Worker error: {e}")
@@ -804,56 +665,37 @@ class DocCrawler:
     async def crawl(self) -> None:
         """Main crawl function using concurrency."""
         try:
-            # Initialize session
             await self.init_session()
-            
-            # Create XML document
             self.create_xml_document()
 
-            # Prepare the queue with our initial URL
             queue: asyncio.Queue[Tuple[str, int]] = asyncio.Queue()
             await queue.put((self.start_url, 0))
-
-            # Set up progress bar (we'll approximate total as max_pages to start)
             self.pbar = tqdm.tqdm(total=self.max_pages, desc="Crawling", unit="page")
 
-            # Create and start worker tasks
             tasks = []
             for _ in range(self.concurrency):
                 t = asyncio.create_task(self.worker(queue))
                 tasks.append(t)
 
-            # Wait until the queue is fully processed or we've reached max_pages
             await queue.join()
 
-            # Cancel any remaining worker tasks
             for t in tasks:
                 t.cancel()
 
-            # Close progress bar
             self.pbar.close()
-
-            # Save XML to file
             self.save_xml_to_file()
             
         except KeyboardInterrupt:
             logger.info("Crawl interrupted by user")
             print(f"\n{Fore.YELLOW}Crawl interrupted. Saving progress...{Style.RESET_ALL}")
-            
-            # Save partial results
             if self.xml_root and self.pages_crawled > 0:
                 self.save_xml_to_file()
-                
         except Exception as e:
             logger.error(f"Crawl error: {e}")
             print(f"{Fore.RED}Error during crawl: {e}{Style.RESET_ALL}")
-            
         finally:
-            # Close progress bar if still open
             if self.pbar:
                 self.pbar.close()
-                
-            # Close session
             await self.close_session()
             
 def parse_arguments():
@@ -865,7 +707,6 @@ def parse_arguments():
     
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
     
-    # Crawl command
     crawl_parser = subparsers.add_parser("crawl", help="Crawl a website documentation")
     crawl_parser.add_argument("start_url", help="Starting URL to crawl")
     crawl_parser.add_argument("--output-file", default="docs_archive.xml", help="Output XML file")
@@ -886,11 +727,12 @@ def parse_arguments():
     crawl_parser.add_argument("--strip-css", action="store_true", default=True, help="Remove CSS content")
     crawl_parser.add_argument("--strip-comments", action="store_true", default=True, help="Remove HTML comments")
     crawl_parser.add_argument("--robots-txt", action="store_true", default=False, help="Respect robots.txt rules")
-    
-    # NEW: concurrency argument
     crawl_parser.add_argument("--concurrency", type=int, default=5, help="Number of concurrent requests")
 
-    # Version command
+    # New switch: Restrict path to the starting path
+    crawl_parser.add_argument("--restrict-path", action="store_true", default=False,
+                              help="Restrict crawling to paths starting with the start_url's path")
+
     version_parser = subparsers.add_parser("version", help="Show version information")
     
     args = parser.parse_args()
@@ -910,7 +752,6 @@ async def main():
         return
         
     if args.command == "crawl":
-        # Print banner
         banner = f"""
 {Fore.CYAN}
  ____              ____                    _           
@@ -924,12 +765,10 @@ Starting crawl from: {Fore.GREEN}{args.start_url}{Style.RESET_ALL}
         """
         print(banner)
         
-        # Create and run crawler
         crawler = DocCrawler(args)
         await crawler.crawl()
 
 if __name__ == "__main__":
-    # Run with asyncio
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())
