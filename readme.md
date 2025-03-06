@@ -17,6 +17,8 @@
 - **Concurrent Requests**: Speed up crawling with configurable concurrency.
 - **Cleaned Output**: Leverages [readability-lxml](https://github.com/buriy/python-readability) to extract main content and supports additional cleaning of HTML.
 
+---
+
 ## Installation
 
 1. **Clone or Download** the `docs2xml.py` file.
@@ -29,14 +31,14 @@
    chmod +x docs2xml.py
    ```
 
+---
+
 ## Usage
 
 ```bash
 python docs2xml.py crawl <start_url> [options]
-
-# or simply omit 'crawl' since it's inserted by default:
-python docs2xml.py <start_url> [options]
 ```
+*(Note: you can also omit the `crawl` keyword—it's inserted by default.)*
 
 ### Options
 
@@ -51,7 +53,7 @@ python docs2xml.py <start_url> [options]
 | `--exclude-pattern=<regex>` | `None`             | Regex pattern to **exclude**. If provided, any URL matching this pattern will be skipped.         |
 | `--timeout=<seconds>`       | `30`               | Request timeout (in seconds).                                                                     |
 | `--verbose`                 | `False`            | Enable verbose logging for debugging.                                                             |
-| `--include-images`          | `False`            | Extract image tags (`<img>`) into the XML output with `alt` text.                                 |
+| `--include-images`          | `False`            | Extract `<img>` tags into the XML output with `alt` text.                                         |
 | `--include-code`            | `True`             | Extract code blocks with basic language detection.                                                |
 | `--extract-headings`        | `True`             | Organize content under headings hierarchically.                                                  |
 | `--follow-links`            | `False`            | Follow links to **external** domains. By default, only the starting domain is crawled.            |
@@ -63,97 +65,111 @@ python docs2xml.py <start_url> [options]
 | `--concurrency=<N>`         | `5`                | Number of concurrent requests (async workers).                                                    |
 | `--restrict-path`           | `False`            | Restrict crawling to paths that **start** with your `start_url` path.                             |
 
-### Examples
+---
+
+## Examples
+
+Below are some real-world use case examples using well-known documentation sites.
+
+### 1. **Basic Crawl**
+
+```bash
+python docs2xml.py https://docs.mistral.ai/getting-started
+```
+- Crawls `https://docs.mistral.ai/getting-started` with default settings (max-depth=5, max-pages=1000, concurrency=5).
+- Extracts content into `docs_archive.xml`.
 
 ---
 
-#### 1. Basic Crawl
+### 2. **Restrict by Path**
+
 ```bash
-python docs2xml.py https://docs.anthropic.com
+python docs2xml.py https://docs.mistral.ai/getting-started --restrict-path
 ```
-Crawls `https://docs.anthropic.com` with default settings: depth = 5, pages = 1000, concurrency = 5.
+- Strictly crawls pages **only** whose path begins with `/getting-started`.  
+- Any links pointing above `/getting-started` or to another domain are ignored.
 
 ---
 
-#### 2. Enabling the `--restrict-path` Switch
+### 3. **Include Pattern**: Narrow to a Sub-Section
+
 ```bash
-python docs2xml.py crawl https://docs.software.ai/getting-started --restrict-path
+python docs2xml.py https://docs.anthropic.com/en/prompt-library/ --include-pattern="prompts" --max-depth=3
 ```
-Only crawls pages **whose path begins** with `/getting-started`. E.g., `https://docs.software.ai/getting-started/foo`, etc.
+- This command starts at `https://docs.anthropic.com/en/prompt-library/`.
+- Only crawls URLs (up to 3 levels deep) **if** they contain the substring "`prompts`" in them.
+- Useful if you only want, say, specialized pages that mention “prompts” in their URL.
 
 ---
 
-#### 3. Regex Filtering with `--include-pattern`
-**Regex** can be used to filter in only certain URLs:
+### 4. **Exclude Pattern**: Skip Certain Sections
+
 ```bash
-python docs2xml.py crawl https://example.com --include-pattern="docs"
+python docs2xml.py https://ai.google.dev/gemini-api/docs/ --exclude-pattern="changelog|release-notes"
 ```
-Only crawls URLs that contain `docs`.
+- Begins crawling from `https://ai.google.dev/gemini-api/docs/`.
+- Skips any pages that match `changelog` or `release-notes` in the URL.
+- Allows you to **avoid** less relevant sections or noisy pages.
 
-##### More Extensive Regex Examples
+---
 
-1. **Match a Specific Subpath**  
+### 5. **Follow External Links** + Depth Limit
+
+```bash
+python docs2xml.py https://platform.openai.com/docs/api-reference/chat/ --follow-links --max-depth=2
+```
+- Follows external links from `platform.openai.com` to other domains if encountered.
+- Limits recursion depth to 2, preventing the crawl from going too deep across external sites.
+- Potentially collects references to supporting pages outside the main domain.
+
+---
+
+### 6. **Concurrency & Delay Tweaks**
+
+```bash
+python docs2xml.py https://platform.openai.com/docs/api-reference/chat/ --concurrency=10 --delay=0.1
+```
+- Uses 10 asynchronous worker tasks to speed up crawling.
+- Reduces the delay between each request to 0.1 seconds (be mindful of server load).
+
+---
+
+### 7. **Regex Examples for Include Pattern**
+
+Here are some more specific regex patterns you might use in `--include-pattern`:
+**Remember when using Regex make sure to escape the . so that it’s interpreted literally (e.g. software\.ai instead of software.ai).**
+
+1. **Match a Path Prefix**  
    ```bash
-   --include-pattern="^https://example\.com/docs/"
+   --include-pattern="^https://docs\.anthropic\.com/en/prompt-library/guides"
    ```
-   - `^` anchors the start of the string.
-   - Matches any URL that begins with `https://example.com/docs/`.
+   - Only crawl pages whose URL starts with `https://docs.anthropic.com/en/prompt-library/guides...`.
 
-2. **Match Multiple Paths**  
+2. **Match Multiple Keywords**  
    ```bash
-   --include-pattern="(tutorial|guide)"
+   --include-pattern="(token|embedding|prompt)"
    ```
-   - Matches URLs containing either `tutorial` or `guide`.
+   - Includes any URLs containing “token,” “embedding,” or “prompt” in their text.
 
-3. **Match Specific File Extensions**  
+3. **Match a File Extension**  
    ```bash
    --include-pattern="\.html?$"
    ```
-   - Matches URLs ending with `.htm` or `.html`.
+   - Only process URLs ending with `.htm` or `.html`.
 
-4. **Match Query Parameters**  
+4. **Combine with `--restrict-path`**  
    ```bash
-   --include-pattern="\?section="
+   python docs2xml.py https://ai.google.dev/gemini-api/docs/ --restrict-path --include-pattern="advanced"
    ```
-   - Only includes URLs that have `?section=` in the query string.
-
-5. **Combine with `--restrict-path`**  
-   ```bash
-   python docs2xml.py crawl https://docs.example.com/start --restrict-path --include-pattern="^https://docs\.example\.com/start/tutorials"
-   ```
-   - Ensures we only crawl the path `/start/...`
-   - Further narrows it to URLs containing `/start/tutorials...`
+   - Only crawls pages under the initial path (`/gemini-api/docs/`) that also contain “advanced” in the URL.
 
 ---
 
-#### 4. Excluding Certain URLs
-```bash
-python docs2xml.py https://example.com --exclude-pattern="blog|login"
-```
-Skips URLs that contain the words `blog` or `login`.
-
----
-
-#### 5. Following External Links
-```bash
-python docs2xml.py crawl https://docs.anthropic.com --follow-links --max-depth=2
-```
-Includes external domains and limits recursion depth to 2.
-
----
-
-#### 6. Concurrency & Delay Tweaks
-```bash
-python docs2xml.py https://docs.anthropic.com --concurrency=10 --delay=0.1
-```
-Uses 10 worker tasks with a 0.1s delay.
-
----
-
-### How It Works
+## How It Works
 
 1. **Queue-Based Crawler**  
-   An `asyncio.Queue` manages discovered URLs. A fixed number of workers (`--concurrency`) fetch, parse, and enqueue new links.
+   - The crawler uses an `asyncio.Queue` to manage discovered URLs.
+   - A fixed number of workers (`--concurrency`) fetch, parse, and enqueue new links until the queue is empty or `--max-pages` is reached.
 
 2. **HTML Processing**  
    - By default, JavaScript, CSS, and comments are removed.  
@@ -161,7 +177,7 @@ Uses 10 worker tasks with a 0.1s delay.
    - Headings, paragraphs, lists, tables, and code blocks are identified and placed into structured blocks in the final XML.
 
 3. **Output in XML**  
-   The default `docs_archive.xml` contains:
+   The output (by default `docs_archive.xml`) contains:
    - **`<page>`** elements with:
      - `<title>`  
      - `<meta>` data  
@@ -169,18 +185,26 @@ Uses 10 worker tasks with a 0.1s delay.
    - A `<metadata>` section with timestamps, total pages crawled, and other crawler details.
 
 4. **Failure Tracking**  
-   Any URL that cannot be fetched is recorded with an error message. If `--verbose` is on, more detail is displayed.
+   Any URL that cannot be fetched is recorded with an error message (`--verbose` will show more details).
 
 5. **Clipboard & Token Count**  
-   - If `pyperclip` is installed, the final XML is copied to your clipboard automatically.  
-   - If `tiktoken` is installed, a token count is printed.
+   - If `pyperclip` is installed, final XML is automatically copied to your clipboard.  
+   - If `tiktoken` is installed, a token count for the XML is printed.
+
+---
 
 ## Troubleshooting
 
-- **Missing Dependencies**: Ensure all required libraries are installed:
+- **Missing Dependencies**: Confirm you have installed the required libraries:
   ```bash
   pip install aiohttp beautifulsoup4 lxml readability-lxml langdetect tqdm colorama robots pyperclip tiktoken
   ```
 - **Timeout Errors**: Increase `--timeout` or reduce `--concurrency`.
-- **Permission Denied** (Linux/macOS): Run `chmod +x docs2xml.py` or call `python docs2xml.py` directly.
-- **Encoding/Locale Issues**: If you encounter strange characters, consider adjusting your system’s locale or forcibly specifying response encoding in `aiohttp`.
+- **Permission Denied** (on Linux/macOS):  
+  ```bash
+  chmod +x docs2xml.py
+  ./docs2xml.py <your_url>
+  ```
+  Or run via `python docs2xml.py`.
+- **Encoding/Locale Issues**: If you see strange characters, consider adjusting your system’s locale or forcing a specific encoding in `aiohttp`.
+
