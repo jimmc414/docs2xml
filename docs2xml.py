@@ -1,38 +1,27 @@
 #!/usr/bin/env python3
 """
-DocCrawler: A CLI utility to crawl website documentation and archive it in XML format for LLM ingestion.
+docs2xml: Crawl website documentation into XML, optionally chunk+embed in ChromaDB.
 
 Usage:
     python docs2xml.py crawl <start_url> [options]
-    python docs2xml.py --help
+    python docs2xml.py embed <xml_file> [options]
+    python docs2xml.py version
 
-Options:
-    --output-file=<file>        Output XML file [default: docs_archive.xml]
-    --max-depth=<depth>         Maximum crawl depth [default: 5]
-    --max-pages=<pages>         Maximum pages to crawl [default: 1000]
-    --user-agent=<agent>        User agent string [default: DocCrawler/1.0]
-    --delay=<seconds>           Delay between requests in seconds [default: 0.2]
-    --include-pattern=<regex>   URL pattern to include [default: None]
-    --exclude-pattern=<regex>   URL pattern to exclude [default: None]
-    --timeout=<seconds>         Request timeout in seconds [default: 30]
-    --verbose                   Verbose output [default: False]
-    --include-images            Include image descriptions in output [default: False]
-    --include-code              Include code blocks with language detection [default: True]
-    --extract-headings          Extract and hierarchically organize headings [default: True]
-    --follow-links              Follow links to external domains [default: False]
-    --clean-html                Enhance cleaning of HTML content [default: True]
-    --strip-js                  Remove JavaScript content [default: True]
-    --strip-css                 Remove CSS content [default: True]
-    --strip-comments            Remove HTML comments [default: True]
-    --robots-txt                Respect robots.txt rules [default: False]
-    --concurrency=<N>           Number of concurrent requests [default: 5]
-    --restrict-path             Restrict crawling to paths starting with the start_url's path [default: False]
+Example:
+    # Crawl and immediately chunk+embed to Chroma
+    python docs2xml.py crawl https://docs.example.com --chunk-and-embed --embedding-function=openai \
+        --openai-api-key=sk-... --chunk-size=512 --chroma-collection="example_docs"
+
+    # Embed an existing docs_archive.xml file
+    python docs2xml.py embed docs_archive.xml --embedding-function=huggingface \
+        --huggingface-model-name="sentence-transformers/all-MiniLM-L6-v2" \
+        --chunk-size=512 --chroma-collection="my_docs"
 """
 
 import sys
 
 # Insert default subcommand "crawl" if none is provided
-if len(sys.argv) <= 1 or sys.argv[1] not in ['crawl', 'version']:
+if len(sys.argv) <= 1 or sys.argv[1] not in ['crawl', 'embed', 'version']:
     sys.argv.insert(1, 'crawl')
 
 import argparse
@@ -44,6 +33,7 @@ import xml.dom.minidom
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
+# Basic dependencies for crawling
 try:
     import aiohttp
     import bs4
@@ -60,14 +50,11 @@ try:
 except ImportError as e:
     print(f"Error: Required dependency not found: {e}")
     print("Please install all required dependencies with:")
-    print("pip install aiohttp beautifulsoup4 lxml readability-lxml langdetect tqdm colorama python-robots")
+    print("  pip install aiohttp beautifulsoup4 lxml readability-lxml langdetect tqdm colorama python-robots")
     sys.exit(1)
 
-
-# Initialize colorama for cross-platform colored output
 colorama.init()
 
-# Set up logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -75,6 +62,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("doc_crawler")
 
+
+###############################################################################
+#                            CRAWLER IMPLEMENTATION                           #
+###############################################################################
 class DocCrawler:
     """Main crawler class to handle website documentation crawling and XML conversion."""
     
@@ -100,7 +91,21 @@ class DocCrawler:
         self.strip_comments = args.strip_comments
         self.respect_robots = args.robots_txt
         self.concurrency = args.concurrency
-        self.restrict_path = args.restrict_path  # NEW ARGUMENT
+        self.restrict_path = args.restrict_path
+
+        # For chunk+embed
+        self.chunk_and_embed = args.chunk_and_embed
+        self.chunk_size = args.chunk_size
+        self.chunk_overlap = args.chunk_overlap
+        self.chunk_by_chars = args.chunk_by_chars
+        self.ignore_content_boundaries = args.ignore_content_boundaries
+        self.embedding_function_name = args.embedding_function
+        self.openai_api_key = args.openai_api_key
+        self.cohere_api_key = args.cohere_api_key
+        self.huggingface_model_name = args.huggingface_model_name
+        self.chroma_collection = args.chroma_collection
+        self.chroma_persist_dir = args.chroma_persist_dir
+        self.output_chunks = args.output_chunks
 
         # State
         self.visited_urls: Set[str] = set()
@@ -108,16 +113,14 @@ class DocCrawler:
         self.failed_urls: List[Tuple[str, str]] = []
         self.domain = urlparse(self.start_url).netloc
         
-        # We'll parse the path from start_url and store it
         parsed_start = urlparse(self.start_url)
         self.start_url_domain = parsed_start.netloc
         self.start_url_path = parsed_start.path or "/"
 
         self.robots_parsers: Dict[str, RobotFileParser] = {}
         self.xml_root = None
+        self.xml_doc = None
         self.session = None
-        
-        # Progress bar
         self.pbar = None
         
         if self.verbose:
@@ -155,10 +158,6 @@ class DocCrawler:
             try:
                 parser.read()
                 self.robots_parsers[domain] = parser
-                
-                # If no rules are specified, allow by default
-                if not any(rule.pattern for rule in parser._rules):
-                    return True
             except Exception as e:
                 logger.warning(f"Could not fetch robots.txt for {domain}: {e}")
                 # If we can't fetch robots.txt, assume OK to crawl
@@ -243,19 +242,15 @@ class DocCrawler:
             if not href or href.startswith('#') or href.startswith('javascript:'):
                 continue
                 
-            # Convert relative to absolute
             full_url = urljoin(base_url, href)
-            
-            # Remove fragments
-            full_url = full_url.split('#')[0]
+            full_url = full_url.split('#')[0]  # Remove fragments
             
             links.append(full_url)
             
         return links
         
     def detect_code_language(self, code: str) -> str:
-        """Attempt to detect programming language of code block."""
-        # Very rough heuristics
+        """Attempt to detect programming language of code block with naive heuristics."""
         if re.search(r'^\s*(import|from)\s+\w+\s+import|def\s+\w+\s*\(|class\s+\w+[:\(]', code):
             return "python"
         elif re.search(r'^\s*(function|const|let|var|import)\s+|=\>|{\s*\n|export\s+', code):
@@ -341,6 +336,7 @@ class DocCrawler:
         if self.extract_headings:
             content_blocks.extend(self.extract_hierarchical_content(soup))
         else:
+            # Fallback: just paragraphs, lists, etc.
             for p in soup.find_all('p'):
                 text = self.clean_text(p.get_text())
                 if text:
@@ -405,7 +401,8 @@ class DocCrawler:
             
             tbody = table.find('tbody') or table
             rows = tbody.find_all('tr')
-            start_idx = 1 if headers and not table.find('thead') and table.find('tr').find('th') else 0
+            # If first row contains <th>, skip it since it's effectively the header
+            start_idx = 1 if headers and not thead and table.find('tr').find('th') else 0
             
             for row in rows[start_idx:]:
                 cells = row.find_all(['td', 'th'])
@@ -566,7 +563,12 @@ class DocCrawler:
         
     def save_xml_to_file(self) -> None:
         """Save the XML document to file."""
+        if not self.xml_doc:
+            logger.error("No XML doc to save.")
+            return
+
         pretty_xml = self.xml_doc.toprettyxml(indent="  ")
+        # Remove empty lines from toprettyxml
         pretty_xml = '\n'.join([line for line in pretty_xml.split('\n') if line.strip()])
         
         try:
@@ -574,15 +576,6 @@ class DocCrawler:
                 f.write(pretty_xml)
             logger.info(f"XML saved to {self.output_file}")
             print(f"{Fore.GREEN}Successfully saved documentation to {self.output_file}{Style.RESET_ALL}")
-            print(f"\n{Fore.CYAN}Crawl Statistics:{Style.RESET_ALL}")
-            print(f"Pages crawled: {self.pages_crawled}")
-            print(f"Failed URLs: {len(self.failed_urls)}")
-            if self.failed_urls and self.verbose:
-                print(f"\n{Fore.YELLOW}Failed URLs:{Style.RESET_ALL}")
-                for url, error in self.failed_urls[:10]:
-                    print(f"- {url}: {error}")
-                if len(self.failed_urls) > 10:
-                    print(f"... and {len(self.failed_urls) - 10} more. Check logs for details.")
         except Exception as e:
             logger.error(f"Error saving XML file: {e}")
             print(f"{Fore.RED}Error saving XML file: {e}{Style.RESET_ALL}")
@@ -596,6 +589,7 @@ class DocCrawler:
         except ImportError:
             logger.warning("pyperclip not installed; cannot copy to clipboard")
         
+        # Attempt to compute token count if tiktoken is installed
         try:
             import tiktoken
             enc = tiktoken.get_encoding("cl100k_base")
@@ -603,20 +597,21 @@ class DocCrawler:
             token_count = len(tokens)
             print(f"{Fore.MAGENTA}Total tokens in output: {token_count}{Style.RESET_ALL}")
         except ImportError:
-            logger.warning("tiktoken not installed; cannot compute token count")
+            logger.debug("tiktoken not installed; skipping token count.")
         
+        # Final stats
         print(f"\n{Fore.CYAN}Crawl Statistics:{Style.RESET_ALL}")
         print(f"Pages crawled: {self.pages_crawled}")
         print(f"Failed URLs: {len(self.failed_urls)}")
         if self.failed_urls and self.verbose:
-            print(f"\n{Fore.YELLOW}Failed URLs:{Style.RESET_ALL}")
+            print(f"\n{Fore.YELLOW}Failed URLs (showing up to 10):{Style.RESET_ALL}")
             for url, error in self.failed_urls[:10]:
                 print(f"- {url}: {error}")
             if len(self.failed_urls) > 10:
                 print(f"... and {len(self.failed_urls) - 10} more. Check logs for details.")
 
     async def worker(self, queue: "asyncio.Queue[Tuple[str,int]]"):
-        """Continuously pulls (url, depth) from the queue, crawls it if eligible, and enqueues new links."""
+        """Async worker that crawls pages from the queue."""
         while True:
             try:
                 url, depth = await queue.get()
@@ -663,7 +658,7 @@ class DocCrawler:
                 queue.task_done()
 
     async def crawl(self) -> None:
-        """Main crawl function using concurrency."""
+        """Main crawl function with concurrency."""
         try:
             await self.init_session()
             self.create_xml_document()
@@ -684,7 +679,7 @@ class DocCrawler:
 
             self.pbar.close()
             self.save_xml_to_file()
-            
+
         except KeyboardInterrupt:
             logger.info("Crawl interrupted by user")
             print(f"\n{Fore.YELLOW}Crawl interrupted. Saving progress...{Style.RESET_ALL}")
@@ -697,17 +692,359 @@ class DocCrawler:
             if self.pbar:
                 self.pbar.close()
             await self.close_session()
-            
+
+        # After crawling, optionally chunk+embed
+        if self.chunk_and_embed:
+            embedder = Embedder(
+                embedding_function_name=self.embedding_function_name,
+                openai_api_key=self.openai_api_key,
+                cohere_api_key=self.cohere_api_key,
+                huggingface_model_name=self.huggingface_model_name,
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.chunk_overlap,
+                chunk_by_chars=self.chunk_by_chars,
+                ignore_content_boundaries=self.ignore_content_boundaries,
+                chroma_collection=self.chroma_collection,
+                chroma_persist_dir=self.chroma_persist_dir,
+                output_chunks=self.output_chunks,
+            )
+            embedder.run_embedding_workflow(self.output_file)
+
+
+###############################################################################
+#                           EMBEDDING / CHUNKING CODE                         #
+###############################################################################
+
+class Embedder:
+    """Handles chunking of XML content and embedding with chosen embedding provider, storing results in ChromaDB."""
+
+    def __init__(
+        self,
+        embedding_function_name: str = "default",
+        openai_api_key: Optional[str] = None,
+        cohere_api_key: Optional[str] = None,
+        huggingface_model_name: Optional[str] = None,
+        chunk_size: int = 1024,
+        chunk_overlap: int = 128,
+        chunk_by_chars: bool = False,
+        ignore_content_boundaries: bool = False,
+        chroma_collection: str = "documentation",
+        chroma_persist_dir: str = "./chroma_db",
+        output_chunks: Optional[str] = None,
+    ):
+        self.embedding_function_name = embedding_function_name
+        self.openai_api_key = openai_api_key
+        self.cohere_api_key = cohere_api_key
+        self.huggingface_model_name = huggingface_model_name
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.chunk_by_chars = chunk_by_chars
+        self.ignore_content_boundaries = ignore_content_boundaries
+        self.chroma_collection = chroma_collection
+        self.chroma_persist_dir = chroma_persist_dir
+        self.output_chunks = output_chunks
+
+        self.embedding_fn = self._get_embedding_fn()
+
+    def _get_embedding_fn(self):
+        """Return an embedding function object recognized by Chroma."""
+        import chromadb
+        from chromadb.utils import embedding_functions
+
+        # Default embedding
+        if self.embedding_function_name == "default":
+            return embedding_functions.DefaultEmbeddingFunction()
+
+        if self.embedding_function_name == "openai":
+            try:
+                import openai
+            except ImportError:
+                raise ImportError("You must `pip install openai` to use OpenAI embeddings.")
+            if not self.openai_api_key:
+                raise ValueError("OpenAI API key not provided. Use --openai-api-key=<key>.")
+            openai.api_key = self.openai_api_key
+
+            # Chroma has a helper for this
+            return embedding_functions.OpenAIEmbeddingFunction(api_key=self.openai_api_key, model_name="text-embedding-ada-002")
+
+        if self.embedding_function_name == "cohere":
+            try:
+                import cohere
+            except ImportError:
+                raise ImportError("You must `pip install cohere` to use Cohere embeddings.")
+            if not self.cohere_api_key:
+                raise ValueError("Cohere API key not provided. Use --cohere-api-key=<key>.")
+            return embedding_functions.CohereEmbeddingFunction(api_key=self.cohere_api_key)
+
+        if self.embedding_function_name == "huggingface":
+            try:
+                from sentence_transformers import SentenceTransformer
+            except ImportError:
+                raise ImportError("You must `pip install sentence-transformers` to use huggingface embeddings.")
+            model_name = self.huggingface_model_name or "sentence-transformers/all-MiniLM-L6-v2"
+            return embedding_functions.HuggingFaceEmbeddingFunction(model_name=model_name)
+
+        # Fall back to default if none matched
+        return embedding_functions.DefaultEmbeddingFunction()
+
+    def run_embedding_workflow(self, xml_file: str):
+        """Main entry: parse XML, chunk it, embed in ChromaDB, optionally save chunk JSON."""
+        print(f"{Fore.CYAN}Embedding workflow started...{Style.RESET_ALL}")
+        # Parse XML
+        docs = self._load_and_flatten_xml(xml_file)
+
+        # Chunk
+        chunks = self._chunk_documents(docs)
+
+        # Save chunks if requested
+        if self.output_chunks:
+            import json
+            with open(self.output_chunks, 'w', encoding='utf-8') as f:
+                json.dump(chunks, f, indent=2)
+            print(f"{Fore.GREEN}Chunked output saved to {self.output_chunks}{Style.RESET_ALL}")
+
+        # Store in Chroma
+        self._store_in_chroma(chunks)
+        print(f"{Fore.GREEN}Embedding workflow complete! Stored {len(chunks)} chunks in ChromaDB.{Style.RESET_ALL}")
+
+    def _load_and_flatten_xml(self, xml_file: str) -> List[Dict]:
+        """Load the XML file and flatten each page's content blocks into text segments."""
+        from xml.dom.minidom import parse
+
+        dom = parse(xml_file)
+        pages = dom.getElementsByTagName("page")
+        docs = []
+
+        for page in pages:
+            url = page.getAttribute("url")
+            title_nodes = page.getElementsByTagName("title")
+            title = title_nodes[0].childNodes[0].nodeValue if title_nodes and title_nodes[0].childNodes else ""
+
+            # Flatten each page's text content
+            content_nodes = page.getElementsByTagName("content")
+            texts = []
+            if content_nodes:
+                # For each child element (paragraph, heading, list->item, etc.)
+                for child in content_nodes[0].childNodes:
+                    if not child.nodeName or child.nodeName == "#text":
+                        continue
+                    if child.nodeName in ["paragraph", "heading", "code", "image"]:
+                        node_text = (child.childNodes[0].nodeValue if child.childNodes else "").strip()
+                        if node_text:
+                            texts.append(node_text)
+                    elif child.nodeName == "list":
+                        for item in child.getElementsByTagName("item"):
+                            if item.childNodes:
+                                item_text = item.childNodes[0].nodeValue.strip()
+                                if item_text:
+                                    texts.append(item_text)
+                    elif child.nodeName == "table":
+                        # Optional: flatten table into lines
+                        # For example, each row => a single line
+                        row_nodes = child.getElementsByTagName("row")
+                        for row_node in row_nodes:
+                            cell_texts = []
+                            for cell in row_node.getElementsByTagName("cell"):
+                                if cell.childNodes:
+                                    cell_texts.append(cell.childNodes[0].nodeValue.strip())
+                            if cell_texts:
+                                texts.append(" | ".join(cell_texts))
+
+            combined_text = f"{title}\n\n" + "\n\n".join(texts)
+            docs.append({"url": url, "text": combined_text.strip()})
+
+        return docs
+
+    def _chunk_documents(self, docs: List[Dict]) -> List[Dict]:
+        """Split documents into chunks based on token or character length."""
+        # Try to import tiktoken
+        if not self.chunk_by_chars:
+            try:
+                import tiktoken
+                encoder = tiktoken.get_encoding("cl100k_base")
+            except ImportError:
+                print(f"{Fore.YELLOW}tiktoken not installed; falling back to character-based chunking.{Style.RESET_ALL}")
+                self.chunk_by_chars = True
+                encoder = None
+        else:
+            encoder = None
+
+        all_chunks = []
+        for doc in docs:
+            text = doc["text"]
+            if not text:
+                continue
+            if self.chunk_by_chars:
+                # Character-based chunking
+                doc_chunks = self._split_by_chars(text, self.chunk_size, self.chunk_overlap)
+            else:
+                # Token-based chunking
+                doc_chunks = self._split_by_tokens(text, encoder, self.chunk_size, self.chunk_overlap)
+            for chunk_id, chunk_text in enumerate(doc_chunks):
+                all_chunks.append({
+                    "id": f"{doc['url']}-chunk-{chunk_id}",
+                    "text": chunk_text,
+                    "metadata": {
+                        "source_url": doc['url']
+                    }
+                })
+        return all_chunks
+
+    def _split_by_chars(self, text: str, chunk_size: int, overlap: int) -> List[str]:
+        """Chunk a string by character count, optionally respecting boundaries if requested."""
+        if self.ignore_content_boundaries:
+            # Just slice by fixed windows
+            return self._sliding_window(text, chunk_size, overlap)
+        else:
+            # Attempt to split on paragraphs or lines, then recombine up to chunk_size
+            paragraphs = text.split("\n\n")
+            chunks = []
+            current_chunk = ""
+            for para in paragraphs:
+                if len(current_chunk) + len(para) <= chunk_size:
+                    current_chunk += (para + "\n\n")
+                else:
+                    if current_chunk.strip():
+                        chunks.append(current_chunk.strip())
+                    current_chunk = para + "\n\n"
+            if current_chunk.strip():
+                chunks.append(current_chunk.strip())
+
+            # Now handle overlap if requested
+            if overlap > 0:
+                # We'll do a simple approach: in character-based, we re-append the last `overlap` chars of the last chunk
+                # to the next chunk. This is naive but workable.
+                final_chunks = []
+                for i, chunk in enumerate(chunks):
+                    if i == 0:
+                        final_chunks.append(chunk)
+                        continue
+                    # Prepend overlap from previous chunk
+                    prev_chunk = final_chunks[-1]
+                    overlap_text = prev_chunk[-overlap:] if len(prev_chunk) > overlap else prev_chunk
+                    final_chunks.append(overlap_text + " " + chunk)
+                return final_chunks
+            else:
+                return chunks
+
+    def _split_by_tokens(self, text: str, encoder, chunk_size: int, overlap: int) -> List[str]:
+        """Token-based chunking with optional content-boundary respect."""
+        if not encoder:
+            # Fallback to char-based
+            return self._split_by_chars(text, chunk_size, overlap)
+
+        tokens = encoder.encode(text)
+        if self.ignore_content_boundaries:
+            return self._split_tokens_sliding_window(tokens, encoder, chunk_size, overlap)
+        else:
+            # We'll do a paragraph-based approach, but measure each paragraph in tokens
+            paragraphs = text.split("\n\n")
+            chunked = []
+            current_tokens = []
+
+            for para in paragraphs:
+                para_tokens = encoder.encode(para)
+                if len(current_tokens) + len(para_tokens) <= chunk_size:
+                    current_tokens.extend(para_tokens + encoder.encode("\n\n"))
+                else:
+                    if current_tokens:
+                        chunked.append(encoder.decode(current_tokens).strip())
+                    current_tokens = para_tokens + encoder.encode("\n\n")
+
+            if current_tokens:
+                chunked.append(encoder.decode(current_tokens).strip())
+
+            # Overlap
+            if overlap > 0:
+                final_chunks = []
+                for i, chunk in enumerate(chunked):
+                    if i == 0:
+                        final_chunks.append(chunk)
+                        continue
+                    prev_chunk = final_chunks[-1]
+                    prev_tokens = encoder.encode(prev_chunk)
+                    overlap_tokens = prev_tokens[-overlap:] if len(prev_tokens) > overlap else prev_tokens
+                    # Combine
+                    final_chunks.append(encoder.decode(overlap_tokens) + " " + chunk)
+                return final_chunks
+            else:
+                return chunked
+
+    def _sliding_window(self, text: str, size: int, overlap: int) -> List[str]:
+        """Return a list of fixed-size segments from text, sliding with overlap."""
+        segments = []
+        start = 0
+        text_length = len(text)
+        while start < text_length:
+            end = start + size
+            segment = text[start:end]
+            segments.append(segment)
+            start += (size - overlap)  # slide
+            if start >= text_length:
+                break
+        return segments
+
+    def _split_tokens_sliding_window(self, tokens: List[int], encoder, size: int, overlap: int) -> List[str]:
+        """Fixed-size token windows with overlap."""
+        results = []
+        start = 0
+        total_tokens = len(tokens)
+        while start < total_tokens:
+            end = start + size
+            segment_tokens = tokens[start:end]
+            segment_text = encoder.decode(segment_tokens)
+            results.append(segment_text)
+            start += (size - overlap)
+            if start >= total_tokens:
+                break
+        return results
+
+    def _store_in_chroma(self, chunks: List[Dict]):
+        """Store chunk texts and embeddings in ChromaDB."""
+        import chromadb
+        from chromadb.config import Settings
+
+        client = chromadb.Client(
+            Settings(
+                persist_directory=self.chroma_persist_dir,
+                anonymized_telemetry=False
+            )
+        )
+        # Try to get collection; if not exist, create it
+        collection = None
+        try:
+            collection = client.get_collection(self.chroma_collection, embedding_function=self.embedding_fn)
+        except ValueError:
+            # Does not exist
+            collection = client.create_collection(self.chroma_collection, embedding_function=self.embedding_fn)
+
+        # We add in small batches to avoid issues with large inserts
+        batch_size = 50
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i : i + batch_size]
+            collection.add(
+                documents=[ch['text'] for ch in batch],
+                ids=[ch['id'] for ch in batch],
+                metadatas=[ch['metadata'] for ch in batch]
+            )
+
+
+###############################################################################
+#                          CLI ARGUMENT PARSING & MAIN                        #
+###############################################################################
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="DocCrawler: A CLI utility to crawl website documentation and archive it in XML format",
+        description="docs2xml: Crawl documentation to XML, optionally chunk & embed in ChromaDB.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
     
-    crawl_parser = subparsers.add_parser("crawl", help="Crawl a website documentation")
+    # ---------------------------
+    # crawl subcommand
+    # ---------------------------
+    crawl_parser = subparsers.add_parser("crawl", help="Crawl a website and output XML")
     crawl_parser.add_argument("start_url", help="Starting URL to crawl")
     crawl_parser.add_argument("--output-file", default="docs_archive.xml", help="Output XML file")
     crawl_parser.add_argument("--max-depth", type=int, default=5, help="Maximum crawl depth")
@@ -720,19 +1057,67 @@ def parse_arguments():
     crawl_parser.add_argument("--verbose", action="store_true", help="Verbose output")
     crawl_parser.add_argument("--include-images", action="store_true", help="Include image descriptions in output")
     crawl_parser.add_argument("--include-code", action="store_true", default=True, help="Include code blocks with language detection")
-    crawl_parser.add_argument("--extract-headings", action="store_true", default=True, help="Extract and hierarchically organize headings")
+    crawl_parser.add_argument("--extract-headings", action="store_true", default=True, help="Extract headings hierarchically")
     crawl_parser.add_argument("--follow-links", action="store_true", help="Follow links to external domains")
-    crawl_parser.add_argument("--clean-html", action="store_true", default=True, help="Enhance cleaning of HTML content")
-    crawl_parser.add_argument("--strip-js", action="store_true", default=True, help="Remove JavaScript content")
-    crawl_parser.add_argument("--strip-css", action="store_true", default=True, help="Remove CSS content")
+    crawl_parser.add_argument("--clean-html", action="store_true", default=True, help="Use readability-lxml to focus on main content")
+    crawl_parser.add_argument("--strip-js", action="store_true", default=True, help="Remove <script> tags")
+    crawl_parser.add_argument("--strip-css", action="store_true", default=True, help="Remove <style> tags")
     crawl_parser.add_argument("--strip-comments", action="store_true", default=True, help="Remove HTML comments")
     crawl_parser.add_argument("--robots-txt", action="store_true", default=False, help="Respect robots.txt rules")
     crawl_parser.add_argument("--concurrency", type=int, default=5, help="Number of concurrent requests")
-
-    # New switch: Restrict path to the starting path
     crawl_parser.add_argument("--restrict-path", action="store_true", default=False,
                               help="Restrict crawling to paths starting with the start_url's path")
 
+    # chunk+embed add-ons
+    crawl_parser.add_argument("--chunk-and-embed", action="store_true", default=False,
+                              help="After crawling, chunk and embed the resulting XML into ChromaDB")
+    crawl_parser.add_argument("--chunk-size", type=int, default=1024, help="Chunk size (tokens or chars)")
+    crawl_parser.add_argument("--chunk-overlap", type=int, default=128, help="Overlap (tokens or chars) between chunks")
+    crawl_parser.add_argument("--chunk-by-chars", action="store_true", default=False,
+                              help="Chunk by characters instead of tokens (default uses tiktoken for tokens)")
+    crawl_parser.add_argument("--ignore-content-boundaries", action="store_true", default=False,
+                              help="Ignore paragraph/heading boundaries and chunk purely by size+overlap")
+    crawl_parser.add_argument("--output-chunks", default=None,
+                              help="Optional JSON file to save chunks before embedding")
+
+    # embedding function arguments
+    crawl_parser.add_argument("--embedding-function", default="default", choices=["default", "openai", "cohere", "huggingface"],
+                              help="Select which embedding function to use")
+    crawl_parser.add_argument("--openai-api-key", default=None, help="OpenAI API key for openai embeddings")
+    crawl_parser.add_argument("--cohere-api-key", default=None, help="Cohere API key for cohere embeddings")
+    crawl_parser.add_argument("--huggingface-model-name", default=None,
+                              help="HuggingFace model name (e.g. 'sentence-transformers/all-MiniLM-L6-v2')")
+    crawl_parser.add_argument("--chroma-collection", default="documentation", help="Name of the ChromaDB collection to use")
+    crawl_parser.add_argument("--chroma-persist-dir", default="./chroma_db", help="Directory for ChromaDB persistence")
+
+
+    # ---------------------------
+    # embed subcommand
+    # ---------------------------
+    embed_parser = subparsers.add_parser("embed", help="Embed an existing XML file into ChromaDB")
+    embed_parser.add_argument("xml_file", help="Path to the XML file previously created by docs2xml")
+    embed_parser.add_argument("--chunk-size", type=int, default=1024, help="Chunk size (tokens or chars)")
+    embed_parser.add_argument("--chunk-overlap", type=int, default=128, help="Overlap (tokens or chars) between chunks")
+    embed_parser.add_argument("--chunk-by-chars", action="store_true", default=False,
+                              help="Chunk by characters instead of tokens (default uses tiktoken for tokens)")
+    embed_parser.add_argument("--ignore-content-boundaries", action="store_true", default=False,
+                              help="Ignore paragraph/heading boundaries and chunk purely by size+overlap")
+    embed_parser.add_argument("--output-chunks", default=None,
+                              help="Optional JSON file to save chunks before embedding")
+
+    embed_parser.add_argument("--embedding-function", default="default", choices=["default", "openai", "cohere", "huggingface"],
+                              help="Select which embedding function to use")
+    embed_parser.add_argument("--openai-api-key", default=None, help="OpenAI API key for openai embeddings")
+    embed_parser.add_argument("--cohere-api-key", default=None, help="Cohere API key for cohere embeddings")
+    embed_parser.add_argument("--huggingface-model-name", default=None,
+                              help="HuggingFace model name (e.g. 'sentence-transformers/all-MiniLM-L6-v2')")
+    embed_parser.add_argument("--chroma-collection", default="documentation", help="Name of the ChromaDB collection to use")
+    embed_parser.add_argument("--chroma-persist-dir", default="./chroma_db", help="Directory for ChromaDB persistence")
+
+
+    # ---------------------------
+    # version subcommand
+    # ---------------------------
     version_parser = subparsers.add_parser("version", help="Show version information")
     
     args = parser.parse_args()
@@ -743,14 +1128,14 @@ def parse_arguments():
         
     return args
 
+
 async def main():
-    """Main entry point for the application."""
     args = parse_arguments()
     
     if args.command == "version":
-        print("DocCrawler version 1.0")
+        print("docs2xml version 2.0 (with chunk+embed)")
         return
-        
+
     if args.command == "crawl":
         banner = f"""
 {Fore.CYAN}
@@ -760,15 +1145,34 @@ async def main():
 | |_| | (_) | (__| |___| | | (_| |\\ V  V /| |  __/ |   
 |____/ \\___/ \\___|\\____|_|  \\__,_| \\_/\\_/ |_|\\___|_|   
 {Style.RESET_ALL}
-A CLI utility to crawl website documentation and archive it in XML format for LLM ingestion.
+docs2xml v2.0: Crawl site -> XML, optionally chunk+embed in ChromaDB.
 Starting crawl from: {Fore.GREEN}{args.start_url}{Style.RESET_ALL}
-        """
+"""
         print(banner)
         
         crawler = DocCrawler(args)
         await crawler.crawl()
 
+    elif args.command == "embed":
+        # direct embed of existing XML
+        embedder = Embedder(
+            embedding_function_name=args.embedding_function,
+            openai_api_key=args.openai_api_key,
+            cohere_api_key=args.cohere_api_key,
+            huggingface_model_name=args.huggingface_model_name,
+            chunk_size=args.chunk_size,
+            chunk_overlap=args.chunk_overlap,
+            chunk_by_chars=args.chunk_by_chars,
+            ignore_content_boundaries=args.ignore_content_boundaries,
+            chroma_collection=args.chroma_collection,
+            chroma_persist_dir=args.chroma_persist_dir,
+            output_chunks=args.output_chunks,
+        )
+        embedder.run_embedding_workflow(args.xml_file)
+
+
 if __name__ == "__main__":
+    # For Windows event loop
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())

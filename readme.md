@@ -1,210 +1,301 @@
 # docs2xml
 
-**docs2xml** is a command-line utility that crawls website documentation (or any set of web pages) and archives it in **XML** format. This is useful for ingestion into LLM (Large Language Model) pipelines or other text analysis workflows.
+A **command-line utility** that crawls website documentation (or any set of web pages) and archives it in **XML** format for subsequent use with LLMs or text analysis workflows.  
+It also supports **chunking** and **embedding** the resulting XML into a local [ChromaDB](https://docs.trychroma.com/) vector database.
 
-## Key Highlights
+---
 
-- **Recursive Crawling**: Traverses internal (and optionally external) links up to a specified depth.
-- **Restrict by Path**: An optional `--restrict-path` switch to limit crawling to URLs whose path starts with the path in your `start_url`.
-- **Output in XML**: Captures textual data, headings, code blocks, images, tables, and metadata in a structured XML format.
-- **Flexible Extraction**:
+## Key Features
+
+- **Recursive Crawling**  
+  - Traverses internal (and optionally external) links up to a specified depth.
+  - *Optional:* Restrict paths via `--restrict-path`.
+- **Output in XML**  
+  - Captures textual data, headings, code blocks, images, tables, etc.
+- **Flexible Extraction**  
   - **Include/Exclude** URLs by regex (`--include-pattern`, `--exclude-pattern`).
   - **Strip** JavaScript, CSS, or HTML comments.
-  - **Extract** headings hierarchically.
-  - **Include** code blocks with basic language detection.
-  - **Include** images with `alt` descriptions.
-- **Robots.txt Respect**: Optionally honor robots.txt rules to restrict crawling.
-- **Concurrent Requests**: Speed up crawling with configurable concurrency.
-- **Cleaned Output**: Leverages [readability-lxml](https://github.com/buriy/python-readability) to extract main content and supports additional cleaning of HTML.
+  - **Extract** headings hierarchically or just as paragraphs/lists.
+  - **Include** code blocks (with basic language detection) and/or images.
+- **Robots.txt Respect** (optional).
+- **Concurrent Async Requests** (`--concurrency`).
+- **Clipboard Copy & Token Counting**  
+  - If `pyperclip` is installed, the final XML is automatically copied to your clipboard.  
+  - If `tiktoken` is installed, a token count of the XML is shown at the end.
+
+**New in v2.0**:
+
+- **Chunk & Embed** your crawled XML (or an existing XML) into ChromaDB:
+  - Chunk by **token** or **character** length (`--chunk-by-chars`).
+  - Various embedding functions: `default`, `openai`, `cohere`, `huggingface`.
+  - Store embeddings in a local ChromaDB (`--chroma-collection`, `--chroma-persist-dir`).
+- **`--chunk-and-embed`** for a **one-step** workflow:
+  - Crawl -> XML -> Chunk -> Embed in ChromaDB
+- **Or** use `embed` subcommand on an existing XML file.
 
 ---
 
 ## Installation
 
 1. **Clone or Download** the `docs2xml.py` file.
-2. **Install Required Dependencies**:
+2. **Install Base Dependencies**:
    ```bash
    pip install aiohttp beautifulsoup4 lxml readability-lxml langdetect tqdm colorama robots pyperclip tiktoken
    ```
-3. (Optional) **Make Script Executable** on Linux/macOS:
+   > *Note:* `pyperclip` and `tiktoken` are optional but recommended for copy-to-clipboard and token counting, respectively.
+3. **Install ChromaDB** (required for embedding):
    ```bash
-   chmod +x docs2xml.py
+   pip install chromadb numpy
    ```
+4. **Install Additional Embedding Providers** if needed:
+   - **OpenAI**:
+     ```bash
+     pip install openai
+     ```
+   - **Cohere**:
+     ```bash
+     pip install cohere
+     ```
+   - **HuggingFace**:
+     ```bash
+     pip install sentence-transformers
+     ```
+
+*(You only need to install the packages for whichever embedding provider you choose.)*
 
 ---
 
 ## Usage
 
+The script supports **two primary commands**:  
+1. **`crawl`**: Crawl a website and output XML (optionally chunk+embed).  
+2. **`embed`**: Chunk+embed an existing XML file.
+
+You can always run:
+```bash
+python docs2xml.py --help
+```
+or
+```bash
+python docs2xml.py <command> --help
+```
+to see all options.
+
+---
+
+### 1. Crawling
+
 ```bash
 python docs2xml.py crawl <start_url> [options]
 ```
-*(Note: you can also omit the `crawl` keyword—it's inserted by default.)*
 
-### Options
+**Basic Example**:
+```bash
+python docs2xml.py crawl https://docs.mistral.ai/getting-started
+```
+- Crawls the given URL (and internal links) up to default depth and pages.
+- Outputs to `docs_archive.xml` by default.
 
-| Option                      | Default            | Description                                                                                       |
-|-----------------------------|--------------------|---------------------------------------------------------------------------------------------------|
-| `--output-file=<file>`      | `docs_archive.xml` | Output XML file.                                                                                  |
-| `--max-depth=<depth>`       | `5`                | Maximum link depth to follow.                                                                     |
-| `--max-pages=<pages>`       | `1000`             | Maximum number of pages to crawl.                                                                 |
-| `--user-agent=<agent>`      | `DocCrawler/1.0`   | The User-Agent string used in HTTP requests.                                                      |
-| `--delay=<seconds>`         | `0.2`              | Delay between requests (in seconds) to avoid overwhelming servers.                                |
-| `--include-pattern=<regex>` | `None`             | Regex pattern to **include**. If provided, only URLs matching this pattern will be crawled.       |
-| `--exclude-pattern=<regex>` | `None`             | Regex pattern to **exclude**. If provided, any URL matching this pattern will be skipped.         |
-| `--timeout=<seconds>`       | `30`               | Request timeout (in seconds).                                                                     |
-| `--verbose`                 | `False`            | Enable verbose logging for debugging.                                                             |
-| `--include-images`          | `False`            | Extract `<img>` tags into the XML output with `alt` text.                                         |
-| `--include-code`            | `True`             | Extract code blocks with basic language detection.                                                |
-| `--extract-headings`        | `True`             | Organize content under headings hierarchically.                                                  |
-| `--follow-links`            | `False`            | Follow links to **external** domains. By default, only the starting domain is crawled.            |
-| `--clean-html`              | `True`             | Use readability-lxml to focus on main content; remove extraneous HTML.                            |
-| `--strip-js`                | `True`             | Remove `<script>` tags entirely.                                                                  |
-| `--strip-css`               | `True`             | Remove `<style>` tags entirely.                                                                   |
-| `--strip-comments`          | `True`             | Remove HTML comments (`<!-- ... -->`).                                                            |
-| `--robots-txt`              | `False`            | Respect `robots.txt` rules when crawling.                                                         |
-| `--concurrency=<N>`         | `5`                | Number of concurrent requests (async workers).                                                    |
-| `--restrict-path`           | `False`            | Restrict crawling to paths that **start** with your `start_url` path.                             |
+**Important Options**:
+
+| Option                          | Default            | Description                                                                                       |
+|---------------------------------|--------------------|---------------------------------------------------------------------------------------------------|
+| `--output-file=<file>`          | `docs_archive.xml` | Output XML file                                                                                  |
+| `--max-depth=<depth>`           | `5`                | Maximum link depth to follow                                                                     |
+| `--max-pages=<pages>`           | `1000`             | Maximum pages to crawl                                                                           |
+| `--user-agent=<agent>`          | `DocCrawler/1.0`   | HTTP User-Agent string                                                                           |
+| `--delay=<seconds>`             | `0.2`              | Delay between requests                                                                           |
+| `--include-pattern=<regex>`     | `None`             | Include only URLs matching this regex                                                            |
+| `--exclude-pattern=<regex>`     | `None`             | Exclude URLs matching this regex                                                                 |
+| `--timeout=<seconds>`           | `30`               | Request timeout                                                                                  |
+| `--verbose`                     | `False`            | Enable verbose logging                                                                           |
+| `--include-images`              | `False`            | Extract `<img>` tags into XML (with `alt` text)                                                 |
+| `--include-code`                | `True`             | Extract code blocks with naive language detection                                                |
+| `--extract-headings`            | `True`             | Organize content under headings                                                                  |
+| `--follow-links`                | `False`            | Follow external links                                                                            |
+| `--clean-html`                  | `True`             | Use readability-lxml to filter out extraneous HTML                                              |
+| `--strip-js`                    | `True`             | Remove `<script>` tags                                                                           |
+| `--strip-css`                   | `True`             | Remove `<style>` tags                                                                            |
+| `--strip-comments`              | `True`             | Remove HTML comments                                                                             |
+| `--robots-txt`                  | `False`            | Respect robots.txt rules                                                                         |
+| `--concurrency=<N>`             | `5`                | Number of concurrent async requests                                                              |
+| `--restrict-path`               | `False`            | Restrict URLs to the initial path of your start_url                                              |
+
+**Extra**:
+- `--restrict-path` ensures only pages whose path matches (or is under) the start URL path are crawled.  
+
+---
+
+### 2. Chunk and Embed with ChromaDB
+
+**docs2xml** v2.0 adds optional **chunking** and **embedding** to store content in a local ChromaDB.  
+
+#### Approach A: **Crawl & Embed in One Step**
+```bash
+python docs2xml.py crawl https://docs.example.com \
+  --chunk-and-embed \
+  --chunk-size=512 --chunk-overlap=128 \
+  --embedding-function=openai \
+  --openai-api-key=sk-...
+```
+**What Happens**:
+1. Crawls site -> saves to XML (`docs_archive.xml` by default).  
+2. Splits text into ~512-token chunks (128-token overlap).  
+3. Embeds each chunk using **OpenAI** embeddings.  
+4. Stores chunks in a ChromaDB collection (`documentation` by default in `./chroma_db`).  
+
+#### Approach B: **Embed an Existing XML**
+If you already have an XML file from a previous crawl (or from some other source):
+```bash
+python docs2xml.py embed docs_archive.xml \
+  --chunk-size=1024 \
+  --chunk-overlap=128 \
+  --embedding-function=huggingface \
+  --huggingface-model-name="sentence-transformers/all-MiniLM-L6-v2" \
+  --chroma-collection="my_docs" \
+  --output-chunks=chunks.json
+```
+**What Happens**:
+1. **Reads** `docs_archive.xml`, merges page content into large strings.  
+2. Splits them into chunks of 1024 tokens, with 128-token overlap.  
+3. Embeds chunks using HuggingFace (local model).  
+4. Stores them in the `my_docs` ChromaDB collection, located at `./chroma_db`.  
+5. Also saves a JSON file (`chunks.json`) with the chunk text & metadata.
+
+---
+
+### Chunking Options
+
+| Option                      | Default      | Description                                                                                                         |
+|-----------------------------|--------------|---------------------------------------------------------------------------------------------------------------------|
+| `--chunk-size=<int>`       | `1024`       | Size of each chunk in tokens (or chars if `--chunk-by-chars` is set)                                               |
+| `--chunk-overlap=<int>`    | `128`        | Overlap length between consecutive chunks (tokens or chars)                                                        |
+| `--chunk-by-chars`         | `False`      | If set, chunk by **characters** instead of tokens                                                                  |
+| `--ignore-content-boundaries` | `False`   | Split purely by chunk size, ignoring paragraph/heading boundaries                                                  |
+| `--output-chunks=<file>`   | (Not saved)  | Write chunk data to a JSON file for inspection                                                                     |
+
+> **Token-based chunking** uses [tiktoken](https://github.com/openai/tiktoken) by default. If `tiktoken` isn’t installed or `--chunk-by-chars` is given, it will fall back to character-based chunking.
+
+---
+
+### Embedding Function Options
+
+Select among:
+1. **default**  
+   - A built-in placeholder embedding from Chroma (no API key, lower quality).
+2. **openai**  
+   - Requires `--openai-api-key`.  
+   - Installs `openai` library.  
+   - Uses `text-embedding-ada-002`.
+3. **cohere**  
+   - Requires `--cohere-api-key`.  
+   - Installs `cohere` library.
+4. **huggingface**  
+   - Requires `--huggingface-model-name=<model>`.  
+   - Installs `sentence-transformers`.  
+   - Runs locally (e.g. `"sentence-transformers/all-MiniLM-L6-v2"`).
+
+**ChromaDB**:
+- `--chroma-collection=<name>` (default: `"documentation"`)  
+- `--chroma-persist-dir=<path>` (default: `./chroma_db`)
 
 ---
 
 ## Examples
 
-Below are some real-world use case examples using documentation sites.
-
-### 1. **Basic Crawl**
-
-```bash
-python docs2xml.py https://docs.mistral.ai/getting-started
-```
-- Crawls `https://docs.mistral.ai/getting-started` with default settings (max-depth=5, max-pages=1000, concurrency=5).
-- Extracts content into `docs_archive.xml`.
-
----
-
-### 2. **Restrict by Path**
-
-```bash
-python docs2xml.py https://docs.mistral.ai/getting-started --restrict-path
-```
-- Strictly crawls pages **only** whose path begins with `/getting-started`.  
-- Any links pointing above `/getting-started` or to another domain are ignored.
-
----
-
-### 3. **Include Pattern**: Narrow to a Sub-Section
-
-```bash
-python docs2xml.py https://docs.anthropic.com/en/prompt-library/ --include-pattern="prompts" --max-depth=3
-```
-- This command starts at `https://docs.anthropic.com/en/prompt-library/`.
-- Only crawls URLs (up to 3 levels deep) **if** they contain the substring "`prompts`" in them.
-- Useful if you only want, say, specialized pages that mention “prompts” in their URL.
-
----
-
-### 4. **Exclude Pattern**: Skip Certain Sections
-
-```bash
-python docs2xml.py https://ai.google.dev/gemini-api/docs/ --exclude-pattern="changelog|release-notes"
-```
-- Begins crawling from `https://ai.google.dev/gemini-api/docs/`.
-- Skips any pages that match `changelog` or `release-notes` in the URL.
-- Allows you to **avoid** less relevant sections or noisy pages.
-
----
-
-### 5. **Follow External Links** + Depth Limit
-
-```bash
-python docs2xml.py https://platform.openai.com/docs/api-reference/chat/ --follow-links --max-depth=2
-```
-- Follows external links from `platform.openai.com` to other domains if encountered.
-- Limits recursion depth to 2, preventing the crawl from going too deep across external sites.
-- Potentially collects references to supporting pages outside the main domain.
-
----
-
-### 6. **Concurrency & Delay Tweaks**
-
-```bash
-python docs2xml.py https://platform.openai.com/docs/api-reference/chat/ --concurrency=10 --delay=0.1
-```
-- Uses 10 asynchronous worker tasks to speed up crawling.
-- Reduces the delay between each request to 0.1 seconds (be mindful of server load).
-
----
-
-### 7. **Regex Examples for Include Pattern**
-
-Here are some more specific regex patterns you might use in `--include-pattern`:
-**Remember when using Regex make sure to escape the . so that it’s interpreted literally (e.g. software\.ai instead of software.ai).**
-
-1. **Match a Path Prefix**  
+1. **Basic Crawl Only**  
    ```bash
-   --include-pattern="^https://docs\.anthropic\.com/en/prompt-library/guides"
+   python docs2xml.py crawl https://docs.mistral.ai/getting-started
    ```
-   - Only crawl pages whose URL starts with `https://docs.anthropic.com/en/prompt-library/guides...`.
+   - Outputs to `docs_archive.xml`.
 
-2. **Match Multiple Keywords**  
+2. **Restrict by Path**  
    ```bash
-   --include-pattern="(token|embedding|prompt)"
+   python docs2xml.py crawl https://docs.mistral.ai/getting-started --restrict-path
    ```
-   - Includes any URLs containing “token,” “embedding,” or “prompt” in their text.
+   - Only crawls URLs whose path begins with `/getting-started`.
 
-3. **Match a File Extension**  
+3. **Include/Exclude Patterns**  
    ```bash
-   --include-pattern="\.html?$"
+   python docs2xml.py crawl https://ai.google.dev/gemini-api/docs/ \
+     --include-pattern="advanced" --exclude-pattern="changelog|release-notes"
    ```
-   - Only process URLs ending with `.htm` or `.html`.
+   - Only crawls pages with "advanced" in the URL.
+   - Skips pages that mention "changelog" or "release-notes".
 
-4. **Combine with `--restrict-path`**  
+4. **Follow External Links, Limit Depth**  
    ```bash
-   python docs2xml.py https://ai.google.dev/gemini-api/docs/ --restrict-path --include-pattern="advanced"
+   python docs2xml.py crawl https://platform.openai.com/docs/api-reference/chat/ --follow-links --max-depth=2
    ```
-   - Only crawls pages under the initial path (`/gemini-api/docs/`) that also contain “advanced” in the URL.
+   - Goes up to 2 levels deep, even if links lead off the main domain.
+
+5. **Chunk & Embed Immediately**  
+   ```bash
+   python docs2xml.py crawl https://docs.example.com \
+     --chunk-and-embed \
+     --chunk-size=512 --chunk-overlap=128 \
+     --embedding-function=openai --openai-api-key=sk-...
+   ```
+   - Creates `docs_archive.xml`.
+   - Chunks ~512 tokens, 128 overlap.
+   - Embeds with OpenAI, stores in `documentation` collection in `./chroma_db`.
+
+6. **Embed an Existing XML**  
+   ```bash
+   python docs2xml.py embed docs_archive.xml \
+     --chunk-size=1024 --chunk-overlap=256 \
+     --embedding-function=huggingface \
+     --huggingface-model-name="sentence-transformers/all-MiniLM-L6-v2" \
+     --chroma-collection="product_docs" \
+     --output-chunks=chunks.json
+   ```
+   - Processes `docs_archive.xml`.
+   - Splits into ~1024-token chunks, 256 overlap.
+   - Embeds locally with HuggingFace model.
+   - Saves chunks info to `chunks.json`.
+   - Stores in the `product_docs` collection.
 
 ---
 
-## How It Works
+## Retrieving Documents from Chroma
 
-1. **Queue-Based Crawler**  
-   - The crawler uses an `asyncio.Queue` to manage discovered URLs.
-   - A fixed number of workers (`--concurrency`) fetch, parse, and enqueue new links until the queue is empty or `--max-pages` is reached.
+After embedding, you can use [ChromaDB’s Python API](https://docs.trychroma.com/embeddings) to query relevant chunks. For example:
 
-2. **HTML Processing**  
-   - By default, JavaScript, CSS, and comments are removed.  
-   - [readability-lxml](https://github.com/buriy/python-readability) extracts main content for a cleaner result.  
-   - Headings, paragraphs, lists, tables, and code blocks are identified and placed into structured blocks in the final XML.
+```python
+import chromadb
+from chromadb.config import Settings
+from chromadb.utils import embedding_functions
 
-3. **Output in XML**  
-   The output (by default `docs_archive.xml`) contains:
-   - **`<page>`** elements with:
-     - `<title>`  
-     - `<meta>` data  
-     - `<content>` blocks (headings, paragraphs, lists, code, images, etc.)  
-   - A `<metadata>` section with timestamps, total pages crawled, and other crawler details.
+# Same embedding function used during chunking
+embedding_function = embedding_functions.DefaultEmbeddingFunction()
 
-4. **Failure Tracking**  
-   Any URL that cannot be fetched is recorded with an error message (`--verbose` will show more details).
+client = chromadb.Client(Settings(persist_directory="./chroma_db"))
+collection = client.get_collection("documentation", embedding_function=embedding_function)
 
-5. **Clipboard & Token Count**  
-   - If `pyperclip` is installed, final XML is automatically copied to your clipboard.  
-   - If `tiktoken` is installed, a token count for the XML is printed.
+query_text = "How do I install the software?"
+results = collection.query(
+    query_texts=[query_text],
+    n_results=3
+)
+
+for i, document in enumerate(results["documents"][0]):
+    print(f"Result {i+1}: {document}")
+```
 
 ---
 
 ## Troubleshooting
 
-- **Missing Dependencies**: Confirm you have installed the required libraries:
+- **Missing Dependencies**  
+  Make sure you installed the required libraries, including `chromadb` and any optional embedding packages:
   ```bash
-  pip install aiohttp beautifulsoup4 lxml readability-lxml langdetect tqdm colorama robots pyperclip tiktoken
+  pip install chromadb openai cohere sentence-transformers
   ```
-- **Timeout Errors**: Increase `--timeout` or reduce `--concurrency`.
-- **Permission Denied** (on Linux/macOS):  
-  ```bash
-  chmod +x docs2xml.py
-  ./docs2xml.py <your_url>
-  ```
-  Or run via `python docs2xml.py`.
-- **Encoding/Locale Issues**: If you see strange characters, consider adjusting your system’s locale or forcing a specific encoding in `aiohttp`.
-
+  *(Depending on what you actually use.)*
+- **Timeout or Rate Limits**  
+  Adjust `--timeout` or add `--delay`. For big sites, consider raising `--max-pages`.
+- **Encoding Issues**  
+  Try specifying a UTF-8 locale or adjusting the default encoding if you see weird characters.
+- **Clipboard & Token Count**  
+  - Requires `pyperclip` for copying XML to your clipboard.
+  - Requires `tiktoken` for token counting.
