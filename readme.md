@@ -69,7 +69,7 @@ python docs2xml.py crawl <start_url> [options]
 
 ## Examples
 
-Below are some real-world use case examples using well-known documentation sites.
+Below are some real-world use case examples using documentation sites.
 
 ### 1. **Basic Crawl**
 
